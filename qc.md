@@ -315,3 +315,250 @@
 
 
 _**波函数在一个完备基上线性展开时，各个基向量前的系数可以有投影得到，即将原波函数与每个基向量作内积(向基向量投影)**_
+
+
+
+
+
+## Davidson 算法
+`davidson_nosym1` 是 PySCF 中用于求解**非对称矩阵特征值问题**的 Davidson 迭代算法实现。它通过子空间迭代逐步逼近特征值和特征向量。下面我们逐行详细解析该函数的实现逻辑和关键步骤。
+
+---
+
+### **函数签名**
+```python
+def davidson_nosym1(aop, x0, precond, tol=1e-12, max_cycle=50, max_space=20,
+                    lindep=DAVIDSON_LINDEP, max_memory=MAX_MEMORY,
+                    dot=numpy.dot, callback=None,
+                    nroots=1, lessio=False, left=False, pick=pick_real_eigs,
+                    verbose=logger.WARN, follow_state=FOLLOW_STATE,
+                    tol_residual=None, fill_heff=_fill_heff):
+```
+- **输入参数**：
+  - `aop`：矩阵-向量乘法函数，输入向量列表 `[x]`，返回 `[A*x]`。
+  - `x0`：初始猜测向量（或向量列表）。
+  - `precond`：预处理函数或对角矩阵。
+  - `tol`：收敛容忍度（默认 `1e-12`）。
+  - `max_cycle`：最大迭代次数（默认 50）。
+  - `max_space`：子空间最大维度（默认 20）。
+  - `lindep`：线性依赖阈值（默认 `1e-14`）。
+  - `left`：是否计算左特征向量（默认 `False`）。
+  - `pick`：过滤特征值的函数（默认 `pick_real_eigs`）。
+
+- **输出**：
+  - `conv`：布尔数组，标记各特征值是否收敛。
+  - `e`：特征值列表。
+  - `x`：右特征向量列表。
+  - （可选）`xl`：左特征向量列表（当 `left=True`）。
+
+---
+
+### **初始化阶段**
+#### 1. 日志和参数检查
+```python
+if isinstance(verbose, logger.Logger):
+    log = verbose
+else:
+    log = logger.Logger(misc.StreamObject.stdout, verbose)
+
+if tol_residual is None:
+    toloose = numpy.sqrt(tol)
+else:
+    toloose = tol_residual
+log.debug1('tol %g  toloose %g', tol, toloose)
+```
+- 初始化日志对象。
+- 计算残差收敛阈值 `toloose`（若未直接提供 `tol_residual`，则取 `sqrt(tol)`）。
+
+#### 2. 预处理函数处理
+```python
+if not callable(precond):
+    precond = make_diag_precond(precond)
+```
+- 如果 `precond` 不是函数，将其转换为对角预处理函数（例如 `dx / (diag(A) - e)`）。
+
+#### 3. 初始猜测处理
+```python
+if callable(x0):
+    x0 = x0()
+if isinstance(x0, numpy.ndarray) and x0.ndim == 1:
+    x0 = [x0]
+```
+- 若 `x0` 是函数，调用它生成初始向量。
+- 若 `x0` 是单向量，转换为列表形式。
+
+#### 4. 内存和子空间设置
+```python
+max_space = max_space + (nroots-1) * 6
+_incore = max_memory*1e6/x0[0].nbytes > max_space*2+nroots*3
+lessio = lessio and not _incore
+```
+- 扩展 `max_space` 以容纳多根计算。
+- 判断是否在内存中存储子空间向量（`_incore`）。
+
+---
+
+### **迭代主循环**
+#### 1. 子空间初始化
+```python
+if fresh_start:
+    if _incore:
+        xs = []
+        ax = []
+    else:
+        xs = _Xlist()
+        ax = _Xlist()
+    space = 0
+    xt, x0 = _qr(x0, dot, lindep)[0], None
+```
+- 若需重新开始（`fresh_start`），初始化子空间向量列表 `xs` 和 `ax`。
+- 对初始猜测 `x0` 做 QR 分解，生成正交基 `xt`。
+
+#### 2. 矩阵乘法和子空间扩展
+```python
+axt = aop(xt)
+for k, xi in enumerate(xt):
+    xs.append(xt[k])
+    ax.append(axt[k])
+space += len(xt)
+```
+- 计算 `A*xt` 并扩展子空间。
+
+#### 3. 构建投影矩阵 `heff`
+```python
+if dtype is None:
+    dtype = numpy.result_type(*axt, *xt)
+if heff is None:
+    heff = numpy.empty((max_space+nroots, max_space+nroots), dtype=dtype)
+fill_heff(heff, xs, ax, xt, axt, dot)
+```
+- 初始化子空间矩阵 `heff` 的数据类型。
+- 调用 `_fill_heff` 填充投影矩阵 \( H_{ij} = \langle x_i | A | x_j \rangle \)。
+
+#### 4. 子空间对角化
+```python
+w, v = scipy.linalg.eig(heff[:space,:space])
+if callable(pick):
+    w, v, idx = pick(w, v, nroots, locals())
+```
+- 对 `heff` 做对角化，得到近似特征值 `w` 和特征向量 `v`。
+- 使用 `pick` 函数筛选物理合理的特征值（如剔除虚部过大的解）。
+
+#### 5. 生成新试探向量
+```python
+x0 = _gen_x0(v[:,:nroots], xs)
+if lessio:
+    ax0 = aop(x0)
+else:
+    ax0 = _gen_x0(v[:,:nroots], ax)
+```
+- 通过子空间特征向量组合生成新猜测 `x0`。
+- 计算 `A*x0`（直接调用 `aop` 或从子空间组合）。
+
+#### 6. 残差计算和收敛判断
+```python
+for k, ek in enumerate(e):
+    xt[k] = ax0[k] - ek * x0[k]
+    dx_norm[k] = numpy.sqrt(dot(xt[k].conj(), xt[k]).real)
+    conv[k] = abs(de[k]) < tol and dx_norm[k] < toloose
+```
+- 计算残差 \( r = A x - e x \) 及其范数。
+- 若特征值变化量 `de` 和残差范数均小于阈值，标记为收敛。
+
+#### 7. 预处理和线性依赖处理
+```python
+xt[k] = precond(xt[k], e[0], x0[k])
+xt[k] *= dot(xt[k].conj(), xt[k]).real ** -.5
+```
+- 对残差向量做预处理，加速收敛。
+- 归一化并剔除线性相关的试探向量。
+
+---
+
+### **终止和输出**
+#### 1. 收敛检查
+```python
+if all(conv):
+    break
+```
+- 若所有特征值收敛，退出迭代。
+
+#### 2. 左特征向量计算（可选）
+```python
+if left:
+    w, vl, v = scipy.linalg.eig(heff[:space,:space], left=True)
+    xl = _gen_x0(vl[:,idx[:nroots]], xs)
+```
+- 若需左特征向量，对 `heff` 做左右对角化。
+
+#### 3. 返回结果
+```python
+return numpy.asarray(conv), e, x0
+```
+- 返回收敛状态、特征值和特征向量。
+
+---
+
+### **关键函数说明**
+`_qr`： 在 `davidson_nosym1` 函数中，正交化的过程基于 **Gram-Schmidt 正交化** 的数学原理，并结合了 **QR 分解** 的数值实现。以下是详细的数学依据及其在代码中的体现：
+
+#### **1. Gram-Schmidt 正交化的数学原理**
+Gram-Schmidt 过程将一组线性无关的向量 \(\{v_1, v_2, \dots, v_n\}\) 转换为正交基 \(\{q_1, q_2, \dots, q_n\}\)，步骤如下：
+1. **第一个向量**：直接归一化  
+   \[
+   q_1 = \frac{v_1}{\|v_1\|}
+   \]
+2. **后续向量**：依次减去在前面的正交基上的投影  
+   \[
+   u_k = v_k - \sum_{j=1}^{k-1} \langle q_j, v_k \rangle q_j, \quad q_k = \frac{u_k}{\|u_k\|}
+   \]
+   - \(\langle \cdot, \cdot \rangle\) 是内积（在代码中通过 `dot` 函数实现）。
+   - 若 \( \|u_k\| \) 接近零（小于 `lindep`），则丢弃 \(v_k\)（线性依赖）。
+
+---
+
+#### **2. 代码中的实现（`_qr` 函数）**
+```python
+def _qr(xs, dot, lindep=1e-14):
+    nvec = len(xs)
+    xs = qs = numpy.array(xs, copy=True)  # 输入向量列表
+    rmat = numpy.eye(nvec, order='F', dtype=xs.dtype)  # 初始化R矩阵
+
+    nv = 0  # 记录有效正交基的数量
+    for i in range(nvec):
+        xi = xs[i]
+        for j in range(nv):
+            prod = dot(qs[j].conj(), xi)  # 计算投影系数 <q_j | x_i>
+            xi -= qs[j] * prod            # 减去投影分量（Gram-Schmidt核心步骤）
+            rmat[:,nv] -= rmat[:,j] * prod  # 更新R矩阵
+        innerprod = dot(xi.conj(), xi).real  # 计算剩余向量的范数平方
+        norm = numpy.sqrt(innerprod)
+        if innerprod > lindep:            # 判断线性依赖
+            qs[nv] = xi / norm            # 归一化得到正交基q_k
+            rmat[:nv+1,nv] /= norm        # 更新R矩阵
+            nv += 1
+    return qs[:nv], numpy.linalg.inv(rmat[:nv,:nv])  # 返回正交基和R^{-1}
+```
+
+#### **关键点**：
+- **投影剔除**：通过 `xi -= qs[j] * prod` 实现 Gram-Schmidt 的投影减法。
+- **线性依赖检查**：若剩余范数 `innerprod < lindep`，丢弃该向量。
+- **R矩阵的作用**：记录正交化过程中的线性组合系数，用于恢复原始向量（虽在 Davidson 中未直接使用，但保留数学完整性）。
+
+---
+
+### **3. 为什么需要正交化？数学意义**
+1. **子空间方法的稳定性**：
+   - Davidson 算法通过子空间迭代逼近特征解。若子空间基非正交，矩阵 \( H_\text{eff} = X^\dagger A X \) 的条件数会变差，导致对角化数值不稳定。
+   - 正交基保证 \( X^\dagger X = I \)，避免冗余计算。
+
+2. **避免“信息重复”**：
+   - 线性相关的向量会导致 \( H_\text{eff} \) 奇异，无法求解特征值。
+
+3. **残差向量的有效性**：
+   - 预处理后的残差向量需与当前子空间正交，才能生成新的有效试探方向（否则会陷入已有子空间）。
+
+---
+
+
+
