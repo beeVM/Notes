@@ -416,7 +416,7 @@ if fresh_start:
 
 #### 2. 矩阵乘法和子空间扩展
 ```python
-axt = aop(xt)
+axt = aop(xt)  #aop是一个匿名函数
 for k, xi in enumerate(xt):
     xs.append(xt[k])
     ax.append(axt[k])
